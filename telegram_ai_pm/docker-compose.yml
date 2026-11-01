@@ -21,5 +21,25 @@ services:
         condition: service_healthy
     volumes:
       - ./secrets:/app/secrets:ro
+    init: true
+    stop_grace_period: 30s
+  backup:
+    image: postgres:16
+    user: postgres
+    restart: unless-stopped
+    environment:
+      PGHOST: db
+      PGUSER: pm
+      PGDATABASE: pm
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      KEEP_DAYS: "7"
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["sh", "/scripts/backup-loop.sh"]
+    volumes:
+      - ./scripts:/scripts:ro
+      - backups:/var/lib/postgresql/data
 volumes:
   pgdata:
+  backups:

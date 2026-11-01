@@ -1,45 +1,154 @@
-# Telegram AI Project Manager — MVP 1.0
+# Telegram AI Project Manager
 
-## Features
-- Owner-only Telegram bot (text only), Russian interface.
-- Project drafts and explicit approval.
-- Tasks with deadlines, priorities, acceptance criteria, optional project link.
-- Evidence submission and **manual owner verification** (no automatic artifact inspection).
-- PostgreSQL persistence and event log.
-- Proactive morning 09:00, evening 18:30 and 5-minute deadline polling (Europe/Moscow).
-- `/pause` and `/resume`.
-- Google Calendar read-only events (optional).
-- OpenAI conversational planning; **chat does not automatically write projects/tasks**. Use commands to persist them.
+Персональный Telegram-бот на Python 3.12 и PostgreSQL 16. Доступ разрешён
+только `OWNER_TELEGRAM_ID`; рабочий часовой пояс — Europe/Moscow.
 
-## Start
-1. Create a Telegram bot with @BotFather and obtain BOT_TOKEN. Start a conversation with it.
-2. Get your numeric Telegram user ID from a trusted method; use it for OWNER_TELEGRAM_ID.
-3. Copy `.env.example` to `.env`. Set BOT_TOKEN, OPENAI_API_KEY, OWNER_TELEGRAM_ID and a strong database password in DATABASE_URL.
-4. Create a separate `.env` variable `POSTGRES_PASSWORD` with the **same** password as in DATABASE_URL. URL-encode special characters in DATABASE_URL or use an alphanumeric password.
-5. `mkdir -p secrets`.
-6. Optional Calendar: create Google Cloud OAuth desktop client, enable Google Calendar API, download client JSON as `secrets/google_client.json`. On your local machine: `pip install -r requirements.txt`, then `python google_auth.py`. Copy `secrets/google_token.json` into the server `secrets/` folder. The token has calendar read-only scope.
-7. `docker compose up -d --build` and `docker compose logs -f bot`.
-8. In Telegram send `/start`, `/help`, then create a project and task.
+## Запуск
 
-**Important**: do not publish `.env`, OAuth client secrets, refresh tokens, or your bot token. Run only one bot/scheduler instance. Google OAuth token refresh in this MVP is in-memory and may require reauthorization if the refresh token is revoked. For production use a secure persistent token store.
+1. Создайте бота через BotFather и узнайте свой числовой Telegram ID.
+2. Скопируйте `.env.example` в `.env`. Заполните `BOT_TOKEN`, `OPENAI_API_KEY`,
+   `OWNER_TELEGRAM_ID`, `POSTGRES_PASSWORD` и `DATABASE_URL`.
+   Пароль в URL должен совпадать с `POSTGRES_PASSWORD`; специальные символы
+   в URL необходимо кодировать. Хост БД в Compose — `db`, порт — `5432`.
+3. Выполните `mkdir -p secrets`. Каталог с Google OAuth остаётся необязательным.
+4. Выполните `docker compose up -d --build` и `docker compose logs -f bot`.
+   Перед polling бот применит `alembic upgrade head`. При несовместимой старой
+   схеме миграция завершится ошибкой и откатится без удаления данных.
+5. Проверьте `docker compose ps`, отправьте `/start` и `/help`.
 
-## Example
+Запускайте только один экземпляр бота и планировщика. Для запуска без Docker
+экспортируйте переменные в процесс и используйте `python -m app.main` из этого
+каталога: приложение само не читает `.env`.
+
+Контейнер работает от пользователя `bot` (UID 10001). OAuth-файлы должны быть
+доступны ему для чтения; каталог монтируется только для чтения. Healthcheck
+контролирует heartbeat основного event loop, а не доступность внешних API.
+
+В облачной среде с собственным CA сборка поддерживает BuildKit secret:
+
+```sh
+docker build --secret id=proxy_ca,src=/etc/ssl/certs/ca-certificates.crt -t ai-project .
 ```
-/project Реклама Омега26 | Получать целевые заявки | Кампания запущена, аналитика проверена | work
+
+Сохраняйте настройки прокси и TLS-проверку. Само приложение не настраивает
+прокси aiogram автоматически; при обязательном egress-прокси его интеграцию
+нужно проверить отдельно перед live-запуском.
+
+## Работа с задачами
+
+```text
+/project Реклама | Получить заявки | Проверяемая аналитика | work
 /approve 1
-/task Настроить Метрику | 2026-11-05 16:00 | P1 | Цели настроены и тестовое событие проверено | 1
-/today
+/task Настроить аналитику | 2030-11-05 16:00 | P1 | Тестовое событие получено | 1
+/begin 1
 /done 1 | https://example.com/report
 /verify 1
 ```
 
-## Caveats / next iteration
-- Prototype, not audited for production or security. Validate in staging.
-- A project plan generated in chat is advisory; commands persist records. Autonomous plan generation + approval flow is the next milestone.
-- Calendar read-only; calendar writes and event change notifications are not implemented.
-- Evidence is saved as a text reference and owner-verified, not technically checked by the LLM.
-- Notifications are deduplicated by database key; transient Telegram delivery failures are retried on the next scheduler tick, but exactly-once delivery cannot be guaranteed.
-- Scheduled messages are deterministic templates. LLM is used for direct chat only in this version.
-- No automatic repeat escalation after 30 minutes; no weekly summary yet.
-- Database migrations, tests, rate limits, monitoring, backup/restore and encrypted secret management are required before production use.
-- Telegram messages are truncated to fit message length limits; use pagination for large task sets.
+- `/begin ID`: `planned → in_progress`.
+- `/done ID | результат`: `in_progress → review`, сохраняет доказательство.
+- `/verify ID`: `review → done`, окончательное решение владельца.
+- `/reject ID | причина`: `review → in_progress`.
+- `done` и `cancelled` закрыты для обычных операций. Повторная сдача из
+  `review` запрещена: сначала отклоните результат, если нужна доработка.
+- `/move ID | YYYY-MM-DD HH:MM` меняет срок открытой задачи.
+- `/today`, `/projects`, `/status`, `/pause 120`, `/resume` — просмотр и управление.
+
+Сроки вводятся по Москве и должны быть в будущем. Это проверяется при подготовке
+и повторно при подтверждении. Приоритеты P1–P4 поддерживаются и в командах,
+и в обычном тексте; P1 — самый высокий, P4 — самый низкий.
+
+Обычный текст может создавать черновики задач, начала работы, приоритета,
+одиночного/группового переноса и следующего шага. Изменения применяются только
+по соответствующей кнопке. Все предложения изменений имеют уникальные ID,
+срок действия 24 часа и одноразовое применение под блокировкой строки БД.
+Новое предложение той же операции для той же задачи заменяет старое.
+Старые кнопки из предыдущей версии отвергаются. При изменении исходного
+статуса/значения предложение отклоняется; групповой перенос атомарен.
+Черновики новых задач повторно проверяют сроки, активность проектов и оценки.
+
+`/depends BEFORE AFTER` сохраняет зависимость `BEFORE → AFTER`: результат первой
+задачи нужен для второй. `/undepend BEFORE AFTER` удаляет связь,
+`/dependencies` показывает до 100 сохранённых связей. Разрешены связи внутри
+одного проекта; самоссылки и циклы запрещены. Эти связи отражаются в `/risks`.
+Предположения ИИ сами не создают связи и не считаются утверждёнными.
+Граф пока не блокирует начало работы и не планирует ресурсы автоматически.
+
+Смысловые дубликаты сравниваются программно только внутри одного проекта
+(задачи без проекта сравниваются между собой). AI-проверка доказательств носит
+консультативный характер и не подтверждает содержимое ссылок. Ответы модели
+проверяются перед сохранением; оценки времени должны совпадать с суммой этапов.
+
+## Миграции и обновление
+
+Перед обновлением остановите бота и сделайте резервную копию:
+
+```sh
+docker compose stop bot
+docker compose run --rm --entrypoint sh backup /scripts/backup.sh
+docker compose build bot
+docker compose run --rm --no-deps --entrypoint python bot -m app.migrate
+docker compose up -d --build bot backup
+```
+
+Базовая ревизия принимает старые таблицы без очистки,
+следующая добавляет отсутствующие поля трудозатрат и таблицу зависимостей.
+Несовместимые схемы отвергаются; автоматическое исправление/удаление данных
+не выполняется. Разрушающий downgrade отключён: откат — через проверенную копию.
+
+Новые миграции: `alembic revision --autogenerate -m "description"`, затем
+обязательная проверка сгенерированного файла и `alembic upgrade head`.
+`requirements.in` содержит диапазоны прямых зависимостей, `requirements.txt` —
+проверенный набор точных версий, включая транзитивные зависимости. Обновляйте
+их в отдельном Python 3.12 venv и запускайте тесты перед фиксацией нового набора.
+
+## Резервные копии
+
+Сервис `backup` делает custom-format `pg_dump` при запуске и затем каждые 24 часа,
+проверяет структуру архива, сохраняет SHA-256 и хранит копии за 7 дней в отдельном
+томе `backups`. `KEEP_DAYS` можно изменить в Compose. Ошибка останавливает цикл;
+restart policy повторяет запуск, а причина видна в `docker compose logs backup`.
+
+Периодически проверяйте полное восстановление выбранного дампа:
+
+```sh
+docker compose exec backup sh /scripts/verify-restore.sh /var/lib/postgresql/data/backups/pm-TIMESTAMP-ID.dump
+```
+
+Скрипт проверяет checksum, создаёт новую БД с уникальным именем, восстанавливает
+дамп с `--exit-on-error`, читает таблицу задач и удаляет тестовую БД.
+Рабочая БД не перезаписывается. Роль должна иметь право `CREATE DATABASE`.
+Для рабочего восстановления сначала остановите бота и восстановите проверенный
+дамп в новую БД, затем переключите `DATABASE_URL` и примените миграции.
+
+Том на том же сервере не защищает от потери сервера. Экспортируйте копии на
+отдельное хранилище; `docker compose down -v` удаляет и данные, и копии.
+Секреты, дампы и OAuth-файлы не включайте в Git и Docker build context.
+
+## Проверки
+
+```sh
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt
+TEST_DATABASE_ADMIN_URL=postgresql://USER:PASSWORD@HOST:PORT/DATABASE \
+  PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -v
+```
+
+Тесты требуют PostgreSQL и роль с `CREATE DATABASE`. Создают отдельную БД
+`pm_test_<uuid>` и удаляют её после завершения; существующие БД не изменяют.
+Используют фиктивные ключи и mock-ответы модели, не вызывают Telegram/OpenAI.
+Проверяются гонки подтверждений, атомарность, терминальные статусы, сроки,
+миграции новой/старой схемы, зависимости и неблокирующий Calendar.
+
+## Google Calendar и ограничения
+
+Calendar — только чтение. Создайте OAuth desktop client, включите Calendar API,
+сохраните client JSON как `secrets/google_client.json`, локально запустите
+`python google_auth.py` и передайте `secrets/google_token.json` серверу безопасно.
+Запросы календаря выполняются в отдельном потоке и не блокируют event loop.
+Обновление OAuth-токена пока происходит в памяти.
+
+Утренний брифинг — 09:00, вечерний — 18:30, проверка сроков — раз в 5 минут,
+Europe/Moscow. Доставка уведомлений не гарантирует exactly-once при сбоях.
+Остаются будущей работой контроль загрузки владельца, автоматический план дня,
+полноценный outbox доставки, rate limiting и внешнее хранилище копий.

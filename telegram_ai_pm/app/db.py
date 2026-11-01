@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timezone
-from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Text, DateTime, ForeignKey, Boolean, JSON, UniqueConstraint
+from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Text, DateTime, ForeignKey, Boolean, JSON, UniqueConstraint, CheckConstraint
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
 
 class Base(DeclarativeBase): pass
@@ -69,3 +69,10 @@ class Setting(Base):
     __tablename__ = 'settings'
     key = Column(String(80), primary_key=True)
     value = Column(Text, nullable=False)
+
+
+class TaskDependency(Base):
+    __tablename__ = 'task_dependencies'
+    before_id = Column(Integer, ForeignKey('tasks.id', ondelete='CASCADE'), primary_key=True)
+    after_id = Column(Integer, ForeignKey('tasks.id', ondelete='CASCADE'), primary_key=True)
+    __table_args__ = (CheckConstraint('before_id <> after_id', name='dependency_not_self'),)
