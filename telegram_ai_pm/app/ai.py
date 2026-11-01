@@ -94,6 +94,16 @@ async def classify_intent(text):
     return intent
 
 async def find_semantic_duplicates(new_tasks, existing_tasks):
+    """Never expose tasks from another project to a duplicate comparison."""
+    matches = []
+    for project_id in dict.fromkeys(t['project_id'] for t in new_tasks):
+        proposed = [t for t in new_tasks if t['project_id'] == project_id]
+        existing = [t for t in existing_tasks if t['project_id'] == project_id]
+        matches.extend(await _find_project_duplicates(proposed, existing))
+    return list(dict.fromkeys(matches))
+
+
+async def _find_project_duplicates(new_tasks, existing_tasks):
     """Находит возможные смысловые дубликаты. Базу данных не изменяет."""
     if not new_tasks or not existing_tasks:
         return []
@@ -202,7 +212,8 @@ async def draft_tasks(text):
     for t in tasks:
         title=str(t['title']).strip()[:300]; criteria=str(t['criteria']).strip()[:2000]
         priority=str(t['priority']).upper(); due=str(t['due'])
-        date=datetime.strptime(due,'%Y-%m-%d %H:%M')
+        from .workflow import future_due
+        future_due(due)
         breakdown=t.get('effort_breakdown')
         if not isinstance(breakdown, list) or not 1 <= len(breakdown) <= 8:
             raise ValueError('Invalid effort_breakdown')
@@ -223,14 +234,15 @@ async def draft_tasks(text):
             })
 
         estimate=sum(stage['minutes'] for stage in validated_breakdown)
+        if type(t.get('estimate_minutes')) is not int or t['estimate_minutes'] != estimate:
+            raise ValueError('Оценка не совпадает с суммой этапов.')
         if estimate > 60000:
             raise ValueError('Total effort estimate exceeds limit')
         pid=t.get('project_id')
-        if pid is not None: pid=int(pid)
+        if pid is not None and type(pid) is not int:
+            raise ValueError('Некорректный ID проекта.')
         if not title or not criteria or priority not in ('P1','P2','P3','P4') or (pid is not None and pid not in ids):
             raise ValueError('Модель предложила некорректную задачу.')
-        if date.replace(tzinfo=ZoneInfo('Europe/Moscow')) < now-timedelta(minutes=2):
-            raise ValueError('Модель предложила срок в прошлом.')
         result.append({'title':title,'criteria':criteria,'priority':priority,'due':due,'project_id':pid,'estimate_minutes':estimate,'effort_breakdown':validated_breakdown})
     return result
 

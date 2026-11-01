@@ -9,9 +9,11 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import or_
 from openai import AsyncOpenAI
-from .db import Base, engine, Session, Project, Task, Evidence, EventLog, Notification, Setting, utcnow
+from .db import Base, engine, Session, Project, Task, Evidence, EventLog, Notification, Setting, TaskDependency, utcnow
 from .ai import answer, draft_tasks, assess_evidence, propose_next_step, classify_intent, find_semantic_duplicates
 from .calendar import events_for_day
+from .workflow import (future_due, require_transition, save_change, load_change,
+                       change_buttons, PRIORITIES, CLOSED, validate_task_items)
 
 logging.basicConfig(level=logging.INFO)
 TZ = ZoneInfo('Europe/Moscow')
@@ -32,11 +34,8 @@ def is_worktime():
     return 9 <= n.hour < 19 and not paused()
 
 def date_parse(value):
-    try:
-        d=datetime.strptime(value,'%Y-%m-%d %H:%M').replace(tzinfo=TZ)
-        return d.astimezone(timezone.utc)
-    except ValueError:
-        raise ValueError('Дата должна быть в формате ГГГГ-ММ-ДД ЧЧ:ММ')
+    return future_due(value)
+
 
 def button(label, data):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=label,callback_data=data)]])
@@ -52,6 +51,10 @@ async def help_(m:Message):
     await m.answer('''/project Название | цель | критерий успеха | work/personal — черновик проекта
 /approve ID — утвердить проект
 /task Название | YYYY-MM-DD HH:MM | P1/P2/P3/P4 | критерии | ID проекта (необязательно)
+/begin ID — начать работу (planned → in_progress)
+/depends BEFORE AFTER — сохранить зависимость BEFORE → AFTER
+/undepend BEFORE AFTER — удалить зависимость
+/dependencies — сохранённые зависимости
 /today — задачи и календарь
 /projects — проекты
 /done ID | доказательство — отправить результат на проверку
@@ -91,6 +94,7 @@ async def risks(m: Message):
                     if t.due_at else None
                 ),
                 'estimate_minutes': t.estimate_minutes,
+                'project_id': t.project_id,
             }
             for t in tasks
         ]
@@ -99,6 +103,9 @@ async def risks(m: Message):
         await m.answer('Нет незавершённых задач для анализа.')
         return
 
+    with Session() as s:
+        confirmed_dependencies = [{'before': e.before_id, 'after': e.after_id}
+                                  for e in s.query(TaskDependency).all()]
     await m.answer('Анализирую риски по текущим задачам...')
 
     try:
@@ -205,7 +212,8 @@ async def risks(m: Message):
                     'content': json.dumps(
                         {
                             'now_moscow': localnow().isoformat(),
-                            'tasks': data
+                            'tasks': data,
+                            'confirmed_dependencies': confirmed_dependencies
                         },
                         ensure_ascii=False
                     )
@@ -214,6 +222,8 @@ async def risks(m: Message):
         )
         raw = response.choices[0].message.content or '{}'
         analysis = json.loads(raw)
+        from .risk_validation import validate_analysis
+        validate_analysis(analysis, data)
 
         valid_task_ids = {task['id'] for task in data}
 
@@ -233,9 +243,16 @@ async def risks(m: Message):
                 )
       # Проверяем сроки предполагаемых зависимостей
         tasks_by_id = {task['id']: task for task in data}
+        for dep in analysis.get('dependencies', []):
+            before_task, after_task = tasks_by_id[dep['before']], tasks_by_id[dep['after']]
+            if before_task['project_id'] is None or before_task['project_id'] != after_task['project_id']:
+                raise ValueError('Зависимость между разными проектами')
         deadline_conflicts = []
 
-        for dep in analysis.get('dependencies', []):
+        conflict_edges = analysis.get('dependencies', []) + [
+            edge for edge in confirmed_dependencies
+            if edge['before'] in tasks_by_id and edge['after'] in tasks_by_id]
+        for dep in conflict_edges:
             before = dep['before']
             after = dep['after']
 
@@ -244,7 +261,8 @@ async def risks(m: Message):
 
             if before_due and after_due:
                 if str(before_due) > str(after_due):
-                    deadline_conflicts.append((before, after))
+                    if (before, after) not in deadline_conflicts:
+                        deadline_conflicts.append((before, after))
         
         # Независимая проверка просроченных задач
         now = localnow()
@@ -274,21 +292,20 @@ async def risks(m: Message):
                     f'Некорректные задачи в риске: {task_ids}'
                 )
 
-        if level not in allowed_levels:
+            if level not in allowed_levels:
                 raise ValueError(
                     f'Некорректный уровень риска: {level}'
                 )
 
         if deadline_conflicts:
             report = (
-                '⚠️ Обнаружены конфликты дедлайнов между задачами '
-                'с предполагаемыми зависимостями. '
-                'Если зависимости подтвердятся, необходимо '
-                'согласовать сроки выполнения.'
+                '⚠️ Обнаружены конфликты дедлайнов в зависимостях задач. '
+                'Согласуй сроки выполнения. Предполагаемые связи '
+                'требуют отдельного подтверждения владельца.'
             )
         else:
             report = (
-                'Календарных конфликтов среди выявленных '
+                'Календарных конфликтов среди сохранённых и выявленных '
                 'предполагаемых зависимостей не обнаружено. '
                 'Это не исключает других рисков проекта.'
             )
@@ -343,6 +360,11 @@ async def risks(m: Message):
 
             for i, action in enumerate(next_actions[:3], start=1):
                 report += f'\n{i}. {action}'
+
+        if confirmed_dependencies:
+            report += '\n\nСохранённые зависимости (утверждены владельцем):\n' + '\n'.join(
+                f"#{e['before']} → #{e['after']}" for e in confirmed_dependencies
+                if e['before'] in valid_task_ids and e['after'] in valid_task_ids)
 
         if deadline_conflicts:
             report += '\n\n⚠️ КОНФЛИКТЫ ДЕДЛАЙНОВ:\n'
@@ -427,10 +449,46 @@ async def daily_text():
     with Session() as s:
         tasks=s.query(Task).filter(Task.status.notin_(['done','cancelled'])).order_by(Task.due_at.asc().nullslast()).limit(30).all()
         lines=[f'#{t.id} [{t.priority}/{t.status}] {t.title} — '+(t.due_at.astimezone(TZ).strftime('%d.%m %H:%M') if t.due_at else 'без срока') for t in tasks]
-    events,err=events_for_day(start,end)
+    events,err=await asyncio.to_thread(events_for_day, start, end)
     cal='\n'.join(f"• {e['start']} — {e['title']}" for e in events[:12]) or 'Нет событий'
     if err: cal=err
     return ('Задачи:\n'+'\n'.join(lines or ['Нет открытых задач'])+'\n\nКалендарь:\n'+cal)[:3900]
+
+@dp.message(Command('depends', 'undepend'))
+async def dependency(m: Message):
+    if not allowed(m.from_user.id): return
+    from .dependencies import add_dependency
+    try:
+        command, raw_before, raw_after = m.text.split()
+        before, after = int(raw_before), int(raw_after)
+        with Session.begin() as s:
+            if command.split('@')[0] == '/depends':
+                add_dependency(s, before, after)
+                kind = 'dependency_added'
+            else:
+                task = s.get(Task, before)
+                if task and task.project_id:
+                    s.get(Project, task.project_id, with_for_update=True)
+                edge = s.get(TaskDependency, (before, after))
+                if not edge:
+                    raise ValueError('Зависимость не найдена.')
+                s.delete(edge)
+                kind = 'dependency_removed'
+            s.add(EventLog(kind=kind, object_id=after, detail={'before': before, 'after': after}))
+        result = f'Зависимость #{before} → #{after}: ' + ('сохранена.' if kind == 'dependency_added' else 'удалена.')
+    except ValueError as exc:
+        result = f'{exc} Формат: /depends BEFORE AFTER или /undepend BEFORE AFTER'
+    await m.answer(result)
+
+
+@dp.message(Command('dependencies'))
+async def dependencies(m: Message):
+    if not allowed(m.from_user.id): return
+    with Session() as s:
+        edges = s.query(TaskDependency).order_by(TaskDependency.before_id, TaskDependency.after_id).limit(100).all()
+        result = '\n'.join(f'#{e.before_id} → #{e.after_id}' for e in edges)
+    await m.answer(result or 'Сохранённых зависимостей нет.')
+
 
 @dp.message(Command('done'))
 async def done(m:Message):
@@ -440,15 +498,15 @@ async def done(m:Message):
         if not sep or len(proof)<8: raise ValueError()
     except ValueError: return await m.answer('Формат: /done ID | ссылка или описание результата (минимум 8 символов)')
     with Session.begin() as s:
-        t=s.get(Task,tid)
-        if not t or t.status=='done': msg='Задача не найдена или уже завершена.'
+        t=s.get(Task,tid,with_for_update=True)
+        if not t or t.status != 'in_progress': msg='Сдать результат можно только для задачи в работе. Сначала: /begin ID.'
         else:
-            t.status='review'; s.add(Evidence(task_id=tid,content=proof)); s.add(EventLog(kind='evidence_submitted',object_id=tid)); msg=f'Результат задачи #{tid} сохранён. Проверь соответствие критериям: {t.criteria}\nПодтверди: /verify {tid}\nИли отклони: /reject {tid} | причина'
+            require_transition(t.status, 'review'); t.status='review'; s.add(Evidence(task_id=tid,content=proof)); s.add(EventLog(kind='evidence_submitted',object_id=tid)); msg=f'Результат задачи #{tid} сохранён. Проверь соответствие критериям: {t.criteria}\nПодтверди: /verify {tid}\nИли отклони: /reject {tid} | причина'
     await m.answer(msg)
     if msg.startswith('Результат задачи #'):
         try:
             with Session() as s:
-                current=s.get(Task,tid)
+                current=s.get(Task,tid,with_for_update=True)
                 title, criteria=current.title, current.criteria
             assessment=await assess_evidence(title,criteria,proof)
             await m.answer(('Предварительная AI-проверка (не является подтверждением выполнения):\n'+assessment+'\n\nОкончательное решение остаётся за владельцем: /verify '+str(tid)+' или /reject '+str(tid)+' | причина')[:3900])
@@ -456,16 +514,36 @@ async def done(m:Message):
             logging.exception('Evidence assessment failed')
             await m.answer('Предварительная AI-проверка недоступна. Результат сохранён на ручную проверку; задача не закрыта.')
 
+@dp.message(Command('begin'))
+async def begin(m: Message):
+    if not allowed(m.from_user.id): return
+    try:
+        tid = int(m.text.split()[1])
+        with Session.begin() as s:
+            task = s.get(Task, tid, with_for_update=True)
+            if not task:
+                raise ValueError('Задача не найдена.')
+            if task.status != 'planned':
+                raise ValueError('Начать работу можно только для запланированной задачи; для возврата с проверки используй /reject.')
+            require_transition(task.status, 'in_progress')
+            task.status = 'in_progress'
+            s.add(EventLog(kind='task_status_changed', object_id=tid,
+                           detail={'old': 'planned', 'new': 'in_progress', 'source': 'begin'}))
+        result = f'Задача #{tid} переведена в работу.'
+    except (ValueError, IndexError) as exc:
+        result = str(exc) if isinstance(exc, ValueError) else 'Формат: /begin ID'
+    await m.answer(result)
+
 @dp.message(Command('verify'))
 async def verify(m:Message):
     if not allowed(m.from_user.id): return
     try: tid=int(m.text.split()[1])
     except (IndexError,ValueError): return await m.answer('Формат: /verify ID')
     with Session.begin() as s:
-        t=s.get(Task,tid); ev=s.query(Evidence).filter_by(task_id=tid).order_by(Evidence.id.desc()).first()
+        t=s.get(Task,tid,with_for_update=True); ev=s.query(Evidence).filter_by(task_id=tid).order_by(Evidence.id.desc()).first()
         if not t or t.status!='review' or not ev: msg='Нет задачи с результатом на проверке.'
         else:
-            ev.verified=True; t.status='done'; s.add(EventLog(kind='task_verified',object_id=tid)); msg=f'Задача #{tid} подтверждена и закрыта.'
+            require_transition(t.status, 'done'); ev.verified=True; t.status='done'; s.add(EventLog(kind='task_verified',object_id=tid)); msg=f'Задача #{tid} подтверждена и закрыта.'
     await m.answer(msg)
 
 @dp.message(Command('reject'))
@@ -476,10 +554,10 @@ async def reject(m:Message):
         if not sep or not reason.strip(): raise ValueError()
     except ValueError: return await m.answer('Формат: /reject ID | причина')
     with Session.begin() as s:
-        t=s.get(Task,tid)
+        t=s.get(Task,tid,with_for_update=True)
         if not t or t.status!='review': msg='Задача не ожидает проверки.'
         else:
-            t.status='in_progress'; s.add(EventLog(kind='evidence_rejected',object_id=tid,detail={'reason':reason.strip()})); msg=f'Задача #{tid} возвращена в работу.'
+            require_transition(t.status, 'in_progress'); t.status='in_progress'; s.add(EventLog(kind='evidence_rejected',object_id=tid,detail={'reason':reason.strip()})); msg=f'Задача #{tid} возвращена в работу.'
     await m.answer(msg)
 
 @dp.message(Command('move'))
@@ -490,8 +568,8 @@ async def move(m:Message):
         if not sep: raise ValueError()
     except ValueError: return await m.answer('Формат: /move ID | YYYY-MM-DD HH:MM')
     with Session.begin() as s:
-        t=s.get(Task,tid)
-        if not t or t.status=='done': msg='Задача не найдена или уже закрыта.'
+        t=s.get(Task,tid,with_for_update=True)
+        if not t or t.status in CLOSED: msg='Задача не найдена или уже закрыта.'
         else:
             old=str(t.due_at); t.due_at=due; t.reschedules+=1
             s.add(EventLog(kind='deadline_moved',object_id=tid,detail={'old':old,'new':due.isoformat()}))
@@ -537,334 +615,178 @@ async def confirm_draft(c:CallbackQuery):
 
     draft_key = f'pending_task_draft:{draft_id}'
 
-    with Session.begin() as s:
-        setting = (
-            s.query(Setting)
-            .filter_by(key=draft_key)
-            .with_for_update()
-            .one_or_none()
-        )
+    try:
+        with Session.begin() as s:
+            setting = (
+                s.query(Setting)
+                .filter_by(key=draft_key)
+                .with_for_update()
+                .one_or_none()
+            )
 
-        if not setting:
-            msg = 'Черновик уже обработан или отсутствует. Задачи не созданы.'
-        elif action == 'cancel':
-            s.delete(setting)
-            msg = 'Черновик отменён. Задачи не созданы.'
-        else:
-            tasks = json.loads(setting.value)
-            created = []
+            if not setting:
+                msg = 'Черновик уже обработан или отсутствует. Задачи не созданы.'
+            elif action == 'cancel':
+                s.delete(setting)
+                msg = 'Черновик отменён. Задачи не созданы.'
+            else:
+                tasks = json.loads(setting.value)
+                try:
+                    validate_task_items(tasks)
+                except (ValueError, KeyError, TypeError):
+                    s.delete(setting)
+                    await c.answer('Срок черновика истёк или некорректен. Создай новый.', show_alert=True)
+                    return
+                created = []
 
-            for item in tasks:
-                pid = item['project_id']
-                if pid is not None:
-                    project = s.get(Project, pid)
-                    if not project or project.status != 'active':
+                for item in tasks:
+                    pid = item['project_id']
+                    if pid is not None:
+                        project = s.get(Project, pid)
+                        if not project or project.status != 'active':
+                            raise ValueError(
+                                'Проект больше не активен. Задачи не сохранены.'
+                            )
+
+                    due = date_parse(item['due'])
+                    breakdown = item.get('effort_breakdown', [])
+                    estimate = sum(stage['minutes'] for stage in breakdown)
+
+                    if estimate != item['estimate_minutes']:
                         raise ValueError(
-                            'Проект больше не активен. Задачи не сохранены.'
+                            'Оценка не совпадает с суммой этапов. Задачи не сохранены.'
                         )
 
-                due = date_parse(item['due'])
-                breakdown = item.get('effort_breakdown', [])
-                estimate = sum(stage['minutes'] for stage in breakdown)
-
-                if estimate != item['estimate_minutes']:
-                    raise ValueError(
-                        'Оценка не совпадает с суммой этапов. Задачи не сохранены.'
+                    task = Task(
+                        title=item['title'],
+                        criteria=item['criteria'],
+                        priority=item['priority'],
+                        due_at=due,
+                        project_id=pid,
+                        estimate_minutes=estimate,
+                        effort_breakdown=json.dumps(
+                            breakdown, ensure_ascii=False
+                        )
                     )
+                    s.add(task)
+                    s.flush()
+                    created.append(task.id)
 
-                task = Task(
-                    title=item['title'],
-                    criteria=item['criteria'],
-                    priority=item['priority'],
-                    due_at=due,
-                    project_id=pid,
-                    estimate_minutes=estimate,
-                    effort_breakdown=json.dumps(
-                        breakdown, ensure_ascii=False
-                    )
-                )
-                s.add(task)
-                s.flush()
-                created.append(task.id)
+                    s.add(EventLog(
+                        kind='task_created',
+                        object_id=task.id,
+                        detail={'source': 'approved_chat_draft'}
+                    ))
 
-                s.add(EventLog(
-                    kind='task_created',
-                    object_id=task.id,
-                    detail={'source': 'approved_chat_draft'}
-                ))
+                s.delete(setting)
+                msg = 'Задачи сохранены: ' + ', '.join(
+                    '#' + str(i) for i in created
+                ) + '\nПроверить: /today'
 
-            s.delete(setting)
-            msg = 'Задачи сохранены: ' + ', '.join(
-                '#' + str(i) for i in created
-            ) + '\nПроверить: /today'
+    except (ValueError, KeyError, TypeError) as exc:
+        msg = f'Черновик отклонён: {exc}. Задачи не созданы.'
 
     await c.answer()
     await c.message.edit_reply_markup(reply_markup=None)
     await c.message.answer(msg)
+
+
+@dp.callback_query(F.data.startswith('change:'))
+async def confirm_change(c: CallbackQuery):
+    if not allowed(c.from_user.id):
+        await c.answer('Нет доступа.', show_alert=True)
+        return
+    parts = (c.data or '').split(':')
+    if (len(parts) != 3 or parts[1] not in ('approve', 'cancel')
+            or not re.fullmatch(r'[0-9a-f]{32}', parts[2])):
+        await c.answer('Некорректная кнопка.', show_alert=True)
+        return
+    _, action, token = parts
+    try:
+        with Session.begin() as s:
+            setting, envelope = load_change(s, token)
+            kind, draft = envelope['kind'], envelope['payload']
+            if action == 'cancel':
+                msg = 'Предложение отменено. Ничего не изменено.'
+            elif kind == 'batch_move':
+                updates = []
+                for item in sorted(draft['changes'], key=lambda item: item['id']):
+                    task = s.get(Task, item['id'], with_for_update=True)
+                    if not task or task.status in CLOSED:
+                        raise ValueError(f"Задача #{item['id']} закрыта или отсутствует")
+                    current = task.due_at.isoformat() if task.due_at else None
+                    if current != item['old'] or task.status != item['status']:
+                        raise ValueError(f"Задача #{item['id']} изменилась после формирования плана")
+                    updates.append((task, date_parse(item['new']), current))
+                if not updates:
+                    raise ValueError('Пустой план переноса')
+                for task, due, old in updates:
+                    task.due_at = due
+                    task.reschedules += 1
+                    s.add(EventLog(kind='deadline_moved', object_id=task.id,
+                                   detail={'old': old, 'new': due.isoformat(), 'source': 'approved_batch_move'}))
+                msg = 'Сроки изменены одной транзакцией: ' + ', '.join(f'#{t.id}' for t, _, _ in updates)
+            else:
+                tid = draft['task_id']
+                task = s.get(Task, tid, with_for_update=True)
+                if not task or task.status in CLOSED:
+                    raise ValueError('Задача отсутствует или закрыта')
+                if task.status != draft['status']:
+                    raise ValueError('Статус задачи изменился. Запроси предложение заново')
+                if kind == 'priority':
+                    if task.priority != draft['old'] or draft['new'] not in PRIORITIES:
+                        raise ValueError('Приоритет изменился или некорректен')
+                    task.priority = draft['new']
+                    s.add(EventLog(kind='task_priority_changed', object_id=tid, detail=draft))
+                    msg = f'Приоритет задачи #{tid} изменён на {task.priority}.'
+                elif kind == 'status':
+                    if task.status != draft['old'] or draft['new'] != 'in_progress':
+                        raise ValueError('Недопустимый переход статуса')
+                    require_transition(task.status, draft['new'])
+                    task.status = draft['new']
+                    s.add(EventLog(kind='task_status_changed', object_id=tid, detail=draft))
+                    msg = f'Задача #{tid} переведена в работу.'
+                elif kind == 'move':
+                    current = task.due_at.isoformat() if task.due_at else None
+                    if current != draft['old']:
+                        raise ValueError('Срок задачи уже изменился')
+                    task.due_at = date_parse(draft['new'])
+                    task.reschedules += 1
+                    s.add(EventLog(kind='deadline_moved', object_id=tid, detail=draft))
+                    msg = f'Срок задачи #{tid} изменён.'
+                elif kind == 'next_step':
+                    if task.project_id != draft['project_id']:
+                        raise ValueError('Проект исходной задачи изменился')
+                    project = s.get(Project, task.project_id, with_for_update=True) if task.project_id else None
+                    if task.project_id and (not project or project.status != 'active'):
+                        raise ValueError('Проект больше не активен')
+                    child = Task(title=draft['title'], criteria=draft['criteria'],
+                                 project_id=task.project_id, priority=task.priority,
+                                 due_at=date_parse(draft['due']))
+                    s.add(child)
+                    s.flush()
+                    s.add(EventLog(kind='task_created', object_id=child.id,
+                                   detail={'source': 'approved_next_step', 'parent_task_id': tid}))
+                    msg = f'Создана задача #{child.id} «{child.title}» как следующий шаг по задаче #{tid}.'
+                else:
+                    raise ValueError('Неизвестная операция')
+            s.delete(setting)
+    except (ValueError, KeyError, TypeError) as exc:
+        msg = f'Операция отклонена: {exc}. Ничего не изменено.'
+    await c.answer()
+    if c.message:
+        await c.message.edit_reply_markup(reply_markup=None)
+        await c.message.answer(msg)
 
 
 @dp.callback_query(F.data.startswith('priority_task:'))
-async def confirm_priority(c: CallbackQuery):
-    if not allowed(c.from_user.id):
-        await c.answer('Нет доступа.', show_alert=True)
-        return
-
-    try:
-        _, action, raw_id = c.data.split(':')
-        tid = int(raw_id)
-    except (ValueError, AttributeError):
-        await c.answer('Некорректное подтверждение.', show_alert=True)
-        return
-
-    with Session.begin() as s:
-        setting = s.get(Setting, f'pending_priority:{tid}')
-
-        if not setting:
-            msg = 'Предложение изменения приоритета устарело или уже обработано.'
-
-        elif action == 'cancel':
-            s.delete(setting)
-            msg = f'Изменение приоритета задачи #{tid} отменено.'
-
-        elif action == 'approve':
-            draft = json.loads(setting.value)
-            task = s.get(Task, tid)
-
-            if not task:
-                msg = 'Задача не найдена. Приоритет не изменён.'
-
-            elif task.status in ('done', 'cancelled'):
-                msg = 'Задача закрыта. Приоритет не изменён.'
-
-            elif task.priority != draft['old']:
-                msg = (
-                    'Приоритет задачи уже изменился. '
-                    'Операция не выполнена.'
-                )
-
-            elif draft['new'] not in ('P1', 'P2', 'P3'):
-                msg = 'Недопустимый приоритет.'
-
-            else:
-                task.priority = draft['new']
-
-                s.add(EventLog(
-                    kind='task_priority_changed',
-                    object_id=tid,
-                    detail={
-                        'old': draft['old'],
-                        'new': draft['new'],
-                        'source': 'approved_chat_priority'
-                    }
-                ))
-
-                msg = (
-                    f'Приоритет задачи #{tid} «{task.title}» '
-                    f'изменён на {draft["new"]}.\n'
-                    'Проверить: /today'
-                )
-
-            s.delete(setting)
-
-        else:
-            msg = 'Неизвестное действие.'
-
-    await c.answer()
-    await c.message.edit_reply_markup(reply_markup=None)
-    await c.message.answer(msg)
-    
 @dp.callback_query(F.data.startswith('status_task:'))
-async def confirm_status(c: CallbackQuery):
-    if not allowed(c.from_user.id):
-        await c.answer('Нет доступа.', show_alert=True)
-        return
-
-    try:
-        _, action, raw_id = c.data.split(':')
-        tid = int(raw_id)
-    except (ValueError, AttributeError):
-        await c.answer('Некорректное подтверждение.', show_alert=True)
-        return
-
-    with Session.begin() as s:
-        setting = s.get(Setting, f'pending_status:{tid}')
-
-        if not setting:
-            msg = 'Предложение изменения статуса устарело или уже обработано.'
-
-        elif action == 'cancel':
-            s.delete(setting)
-            msg = f'Изменение статуса задачи #{tid} отменено.'
-
-        elif action == 'approve':
-            draft = json.loads(setting.value)
-            task = s.get(Task, tid)
-
-            if not task:
-                msg = 'Задача не найдена. Статус не изменён.'
-
-            elif task.status != draft['old']:
-                msg = (
-                    'Статус задачи уже изменился. '
-                    'Операция не выполнена.'
-                )
-
-            elif (
-                draft['old'] != 'planned'
-                or draft['new'] != 'in_progress'
-            ):
-                msg = 'Недопустимый переход статуса.'
-
-            else:
-                task.status = 'in_progress'
-
-                s.add(EventLog(
-                    kind='task_status_changed',
-                    object_id=tid,
-                    detail={
-                        'old': draft['old'],
-                        'new': 'in_progress',
-                        'source': 'approved_chat_status'
-                    }
-                ))
-
-                msg = (
-                    f'Задача #{tid} «{task.title}» '
-                    'переведена в статус «В работе».\n'
-                    'Проверить: /today'
-                )
-
-            s.delete(setting)
-
-        else:
-            msg = 'Неизвестное действие.'
-
-    await c.answer()
-    await c.message.edit_reply_markup(reply_markup=None)
-    await c.message.answer(msg)
-
 @dp.callback_query(F.data.startswith('move_task:'))
-async def confirm_move(c:CallbackQuery):
-    if not allowed(c.from_user.id):
-        await c.answer('Нет доступа.', show_alert=True); return
-    try:
-        _, action, raw_id = c.data.split(':')
-        tid = int(raw_id)
-    except (ValueError, AttributeError):
-        await c.answer('Некорректное подтверждение.', show_alert=True); return
-    with Session.begin() as s:
-        setting = s.get(Setting, f'pending_move:{tid}')
-        if not setting:
-            msg = 'Предложение переноса устарело или уже обработано.'
-        elif action == 'cancel':
-            s.delete(setting)
-            msg = f'Перенос задачи #{tid} отменён.'
-        elif action == 'approve':
-            draft = json.loads(setting.value)
-            task = s.get(Task, tid)
-            if not task or task.status in ('done', 'cancelled'):
-                msg = 'Задача отсутствует или закрыта. Срок не изменён.'
-            elif (task.due_at.isoformat() if task.due_at else None) != draft['old']:
-                msg = 'Срок задачи уже изменился. Перенос не выполнен; запроси его заново.'
-            else:
-                new_due = date_parse(draft['new'])
-                task.due_at = new_due
-                task.reschedules += 1
-                s.add(EventLog(kind='deadline_moved', object_id=tid, detail={'old':draft['old'],'new':new_due.isoformat(),'source':'approved_chat_move'}))
-                msg = f'Срок задачи #{tid} «{task.title}» изменён на {new_due.astimezone(TZ):%d.%m.%Y %H:%M} МСК. Проверить: /today'
-            s.delete(setting)
-        else:
-            msg = 'Неизвестное действие.'
-    await c.answer()
-    await c.message.edit_reply_markup(reply_markup=None)
-    await c.message.answer(msg)
-
 @dp.callback_query(F.data.startswith('batch_move:'))
-async def confirm_batch_move(c: CallbackQuery):
-    if not allowed(c.from_user.id):
-        await c.answer('Нет доступа.', show_alert=True); return
-    action = c.data.partition(':')[2]
-    if action not in ('approve', 'cancel'):
-        await c.answer('Неизвестное действие.', show_alert=True); return
-    try:
-        with Session.begin() as s:
-            setting = s.get(Setting, 'pending_batch_move')
-            if not setting:
-                msg = 'План уже обработан или отсутствует.'
-            elif action == 'cancel':
-                s.delete(setting)
-                msg = 'Групповой перенос отменён. Сроки не изменены.'
-            else:
-                draft = json.loads(setting.value)
-                if utcnow() - datetime.fromisoformat(draft['created_at']) > timedelta(hours=24):
-                    s.delete(setting)
-                    msg = 'План устарел. Сформируй его заново.'
-                else:
-                    updates = []
-                    for item in draft['changes']:
-                        task = s.get(Task, item['id'], with_for_update=True)
-                        if not task or task.status in ('done', 'cancelled'):
-                            raise ValueError(f"Задача #{item['id']} закрыта или отсутствует")
-                        current = task.due_at.astimezone(timezone.utc).isoformat() if task.due_at else None
-                        if current != item['old'] or task.status != item['status']:
-                            raise ValueError(f"Задача #{item['id']} изменилась после формирования плана")
-                        new_due = date_parse(item['new'])
-                        if new_due <= utcnow():
-                            raise ValueError(f"Новый срок задачи #{item['id']} уже прошёл")
-                        updates.append((task, new_due, current))
-                    for task, new_due, old in updates:
-                        task.due_at = new_due
-                        task.reschedules += 1
-                        s.add(EventLog(kind='deadline_moved', object_id=task.id,
-                                       detail={'old':old,'new':new_due.isoformat(),
-                                               'source':'approved_batch_move'}))
-                    s.delete(setting)
-                    msg = 'Сроки изменены одной транзакцией: ' + ', '.join(
-                        f'#{task.id} — {due.astimezone(TZ):%d.%m %H:%M}' for task, due, _ in updates)
-                    msg += '\nПроверить: /today'
-    except (ValueError, KeyError, TypeError) as exc:
-        msg = f'Групповой перенос отклонён: {exc}. Ничего не изменено.'
-    except Exception:
-        logging.exception('Batch move failed')
-        msg = 'Ошибка группового переноса. Изменения отменены.'
-    await c.answer()
-    await c.message.edit_reply_markup(reply_markup=None)
-    await c.message.answer(msg)
-
 @dp.callback_query(F.data.startswith('next_step:'))
-async def confirm_next_step(c:CallbackQuery):
-    if not allowed(c.from_user.id):
-        await c.answer('Нет доступа.',show_alert=True); return
-    try:
-        _, action, raw_id = c.data.split(':'); tid=int(raw_id)
-    except (ValueError,AttributeError):
-        await c.answer('Некорректная кнопка.',show_alert=True); return
-    with Session.begin() as s:
-        setting=s.get(Setting,f'pending_next_step:{tid}')
-        if not setting: msg='Предложение уже обработано или отсутствует.'
-        elif action=='cancel':
-            s.delete(setting); msg='Предложение отменено. Новая задача не создана.'
-        elif action=='approve':
-            draft=json.loads(setting.value)
-            parent=s.get(Task,tid)
-            created_at=datetime.fromisoformat(draft['created_at'])
-            if utcnow()-created_at > timedelta(hours=24):
-                msg='Предложение устарело. Запроси следующий шаг заново.'
-            elif not parent or parent.status in ('done','cancelled'):
-                msg='Исходная задача закрыта или отсутствует. Подзадача не создана.'
-            elif parent.project_id is not None and (not s.get(Project,parent.project_id) or s.get(Project,parent.project_id).status!='active'):
-                msg='Проект больше не активен. Подзадача не создана.'
-            else:
-                due=date_parse(draft['due'])
-                child=Task(title=draft['title'],criteria=draft['criteria'],project_id=parent.project_id,priority=parent.priority,due_at=due)
-                s.add(child); s.flush()
-                s.add(EventLog(kind='task_created',object_id=child.id,detail={'source':'approved_next_step','parent_task_id':tid}))
-                msg=f'Создана задача #{child.id} «{child.title}» как следующий шаг по задаче #{tid}. Срок: {due.astimezone(TZ):%d.%m.%Y %H:%M} МСК. Проверить: /today'
-            s.delete(setting)
-        else: msg='Неизвестное действие.'
-    await c.answer()
-    await c.message.edit_reply_markup(reply_markup=None)
-    await c.message.answer(msg)
+async def reject_legacy_confirmation(c: CallbackQuery):
+    await c.answer('Кнопка устарела. Запроси новое предложение.', show_alert=True)
+
 
 @dp.message(F.text)
 async def chat(m:Message):
@@ -882,20 +804,21 @@ async def chat(m:Message):
         wants_batch = bool(re.search(r'соглас|утверд|подтверд|примен|измен.{0,30}срок|перенес|перенести|подготов.{0,30}измен', text))
         if wants_batch:
             with Session() as session:
-                saved = session.get(Setting, 'pending_batch_move')
-                draft = json.loads(saved.value) if saved else None
+                pointer = session.get(Setting, 'latest_change:batch_move:all')
+                saved = session.get(Setting, f'pending_change:{pointer.value}') if pointer else None
+                envelope = json.loads(saved.value) if saved else None
+                draft = envelope['payload'] if envelope else None
+                token = pointer.value if pointer else None
             if not draft or not {item['id'] for item in draft['changes']}.issubset(set(task_ids)):
                 await m.answer('Нет сохранённого плана для этих задач. Сначала попроси проанализировать задачи и предложить промежуточные сроки. Ничего не изменено.')
                 return
-            if utcnow() - datetime.fromisoformat(draft['created_at']) > timedelta(hours=24):
+            if utcnow() - datetime.fromisoformat(envelope['created_at']) > timedelta(hours=24):
                 await m.answer('Сохранённый план устарел. Запроси анализ заново.'); return
             lines = ['Черновик группового изменения сроков (пока НЕ сохранён):']
             for item in draft['changes']:
                 old = datetime.fromisoformat(item['old']).astimezone(TZ).strftime('%d.%m.%Y %H:%M') if item['old'] else 'без срока'
                 lines.append(f"#{item['id']}: {old} → {item['new']} МСК")
-            kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text='✅ Применить все изменения', callback_data='batch_move:approve'),
-                InlineKeyboardButton(text='❌ Отменить', callback_data='batch_move:cancel')]])
+            kb = change_buttons(token, '✅ Применить все изменения')
             await m.answer('\n'.join(lines)+'\n\nВсе изменения применятся вместе только после нажатия кнопки.', reply_markup=kb)
             return
         with Session() as s:
@@ -957,15 +880,14 @@ async def chat(m:Message):
             changes=[]
             with Session() as s:
                 for tid in task_ids:
-                    t=s.get(Task,tid)
+                    t=s.get(Task,tid,with_for_update=True)
                     if tid in proposed and t and t.status not in ('done','cancelled'):
                         old=t.due_at.astimezone(timezone.utc).isoformat() if t.due_at else None
                         if not t.due_at or date_parse(proposed[tid]) != t.due_at.astimezone(timezone.utc):
                             changes.append({'id':tid,'old':old,'new':proposed[tid],'status':t.status})
             if len(changes)>=2:
                 with Session.begin() as s:
-                    s.merge(Setting(key='pending_batch_move',value=json.dumps({
-                        'created_at':utcnow().isoformat(),'changes':changes},ensure_ascii=False)))
+                    save_change(s, 'batch_move', 'all', {'changes': changes})
                 suffix='\n\nПредложенные сроки сохранены как черновик. Чтобы увидеть кнопки подтверждения, напиши: «Согласен с планом по задачам '+', '.join('№'+str(i) for i in task_ids)+'. Подготовь изменение сроков». До подтверждения ничего не изменится.'
             else:
                 suffix='\n\nНе удалось извлечь как минимум два новых срока. Черновик группового переноса не создан.'
@@ -996,13 +918,13 @@ async def chat(m:Message):
         russian_date = re.search(r'\b(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(20\d{2})\s*(?:года)?\s*(?:,|в)?\s*(\d{1,2}):(\d{2})', text)
         
         priority_matches = re.findall(
-            r'\b(?:P[123]|П[123])\b',
+            r'\b(?:P[1234]|П[1234])\b',
             text,
             re.IGNORECASE
         )
 
         priority_match = re.search(
-            r'\b(?:P[123]|П[123])\b',
+            r'\b(?:P[1234]|П[1234])\b',
             priority_matches[-1], re.IGNORECASE
         ) if priority_matches else None
 
@@ -1037,21 +959,21 @@ async def chat(m:Message):
                 await m.answer('Ошибка: выбери одно направление изменения приоритета.')
                 return
 
-            if priority in ('P1', 'P2', 'P3'):
+            if priority in ('P1', 'P2', 'P3', 'P4'):
                 old_level = int(priority[1])
                 new_level = int(new_priority[1])
 
                 if raise_priority and new_level > old_level:
                     await m.answer(
                         f'Нельзя повысить приоритет с {priority} до {new_priority}: '
-                        'P1 — самый высокий, P3 — самый низкий.'
+                        'P1 — самый высокий, P4 — самый низкий.'
                     )
                     return
 
                 if lower_priority and new_level < old_level:
                     await m.answer(
                         f'Нельзя понизить приоритет с {priority} до {new_priority}: '
-                        'P1 — самый высокий, P3 — самый низкий.'
+                        'P1 — самый высокий, P4 — самый низкий.'
                     )
                     return
 
@@ -1070,24 +992,9 @@ async def chat(m:Message):
                 return
 
             with Session.begin() as s:
-                s.merge(Setting(
-                    key=f'pending_priority:{tid}',
-                    value=json.dumps({
-                        'old': priority,
-                        'new': new_priority
-                    })
-                ))
-
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text='✅ Подтвердить изменение',
-                    callback_data=f'priority_task:approve:{tid}'
-                ),
-                InlineKeyboardButton(
-                    text='❌ Отменить',
-                    callback_data=f'priority_task:cancel:{tid}'
-                )
-            ]])
+                token = save_change(s, 'priority', tid, {
+                    'task_id': tid, 'status': status, 'old': priority, 'new': new_priority})
+            keyboard = change_buttons(token, '✅ Подтвердить изменение')
 
             await m.answer(
                 f'Изменение приоритета задачи #{tid} «{title}»\n'
@@ -1114,24 +1021,9 @@ async def chat(m:Message):
                 return
 
             with Session.begin() as s:
-                s.merge(Setting(
-                    key=f'pending_status:{tid}',
-                    value=json.dumps({
-                        'old': status,
-                        'new': 'in_progress'
-                    })
-                ))
-
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text='✅ Подтвердить начало работы',
-                    callback_data=f'status_task:approve:{tid}'
-                ),
-                InlineKeyboardButton(
-                    text='❌ Отменить',
-                    callback_data=f'status_task:cancel:{tid}'
-                )
-            ]])
+                token = save_change(s, 'status', tid, {
+                    'task_id': tid, 'status': status, 'old': status, 'new': 'in_progress'})
+            keyboard = change_buttons(token, '✅ Подтвердить начало работы')
 
             await m.answer(
                 f'Изменение статуса задачи #{tid} «{title}»\n'
@@ -1157,10 +1049,9 @@ async def chat(m:Message):
                     await m.answer(f'Задача #{tid} закрыта. Перенос невозможен.')
                     return
                 with Session.begin() as s:
-                    s.merge(Setting(key=f'pending_move:{tid}',value=json.dumps({'old':old_iso,'new':new_text})))
-                keyboard=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text='✅ Подтвердить перенос',callback_data=f'move_task:approve:{tid}'),
-                    InlineKeyboardButton(text='❌ Отменить',callback_data=f'move_task:cancel:{tid}')]])
+                    token = save_change(s, 'move', tid, {
+                        'task_id': tid, 'status': status, 'old': old_iso, 'new': new_text})
+                keyboard = change_buttons(token, '✅ Подтвердить перенос')
                 await m.answer(f'Перенос задачи #{tid} «{title}»\nСейчас: {old_display}\nНовый срок: {new_due.astimezone(TZ):%d.%m.%Y %H:%M} МСК\nДо подтверждения срок НЕ изменён.',reply_markup=keyboard)
             except ValueError as exc:
                 await m.answer(f'Неверная дата: {exc}')
@@ -1182,7 +1073,7 @@ async def chat(m:Message):
             if status in ('done','cancelled'):
                 await m.answer(f'Задача #{tid} закрыта. Подзадачу не предлагаю.'); return
             with Session() as s:
-                parent=s.get(Task,tid)
+                parent=s.get(Task,tid,with_for_update=True)
                 task_info={'id':tid,'title':title,'description':description,'criteria':criteria,
                            'status':status,'priority':priority,'due':old_display,'project_id':parent.project_id}
             try:
@@ -1194,11 +1085,10 @@ async def chat(m:Message):
                     step_due=(now+timedelta(days=1)).replace(hour=18,minute=0,second=0,microsecond=0)
                 draft={'title':suggestion['title'],'criteria':suggestion['criteria'],
                        'due':step_due.strftime('%Y-%m-%d %H:%M'),'created_at':utcnow().isoformat()}
+                draft.update(task_id=tid, status=status, project_id=task_info['project_id'])
                 with Session.begin() as s:
-                    s.merge(Setting(key=f'pending_next_step:{tid}',value=json.dumps(draft,ensure_ascii=False)))
-                keyboard=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text='✅ Создать подзадачу',callback_data=f'next_step:approve:{tid}'),
-                    InlineKeyboardButton(text='❌ Не создавать',callback_data=f'next_step:cancel:{tid}')]])
+                    token = save_change(s, 'next_step', tid, draft)
+                keyboard = change_buttons(token, '✅ Создать подзадачу')
                 await m.answer(
                     f'Задача #{tid} «{title}»\n\nПервый шаг: {suggestion["title"]}\n'
                     f'Почему: {suggestion["explanation"]}\nКритерий готовности: {suggestion["criteria"]}\n'
@@ -1340,15 +1230,18 @@ async def chat(m:Message):
         logging.exception('LLM failure'); await m.answer('Ошибка модели. Попробуй ещё раз; задачи и календарь не изменены.')
 
 async def send_once(key, text):
+    from sqlalchemy.dialects.postgresql import insert
     with Session.begin() as s:
-        if s.query(Notification).filter_by(key=key).first(): return False
-        s.add(Notification(key=key))
+        claim = s.execute(insert(Notification).values(key=key, created_at=utcnow())
+                          .on_conflict_do_nothing(index_elements=['key'])
+                          .returning(Notification.id)).scalar_one_or_none()
+        if claim is None: return False
     try:
         await bot.send_message(OWNER,text[:3900]); return True
     except Exception:
         logging.exception('Telegram send failure')
         with Session.begin() as s:
-            n=s.query(Notification).filter_by(key=key).first()
+            n=s.get(Notification, claim)
             if n: s.delete(n)
         return False
 
@@ -1427,7 +1320,10 @@ async def deadlines():
         await send_once(key,msg)
 
 async def main():
-    Base.metadata.create_all(engine)
+    from .migrate import upgrade
+    from .health import heartbeat, PATH
+    upgrade()
+    health_task = asyncio.create_task(heartbeat())
     scheduler=AsyncIOScheduler(timezone=TZ)
     scheduler.add_job(morning,'cron',hour=9,minute=0,id='morning',coalesce=True,max_instances=1)
     scheduler.add_job(evening,'cron',hour=18,minute=30,id='evening',coalesce=True,max_instances=1)
@@ -1435,6 +1331,9 @@ async def main():
     scheduler.start()
     try: await dp.start_polling(bot)
     finally:
+        health_task.cancel()
+        await asyncio.gather(health_task, return_exceptions=True)
+        PATH.unlink(missing_ok=True)
         scheduler.shutdown(wait=False); await bot.session.close()
 
 if __name__=='__main__': asyncio.run(main())
