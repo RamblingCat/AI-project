@@ -66,6 +66,7 @@ def validate_task_items(tasks):
 def save_change(session, kind, scope, payload):
     """A new proposal supersedes the previous proposal for the same scope."""
     from sqlalchemy import text
+    session.execute(text('SELECT pg_advisory_xact_lock(782364701)'))
     lock = int.from_bytes(hashlib.blake2b(f'{kind}:{scope}'.encode(), digest_size=8).digest(), 'big', signed=True)
     session.execute(text('SELECT pg_advisory_xact_lock(:key)'), {'key': lock})
     token = uuid.uuid4().hex
@@ -78,14 +79,34 @@ def save_change(session, kind, scope, payload):
         pointer.value = token
     else:
         session.add(Setting(key=pointer_key, value=token))
+    from .db import Task, Project
+    snapshots = []
+    task_ids = []
+    if kind in ('priority', 'status', 'move', 'next_step') and payload.get('task_id'):
+        task_ids = [payload['task_id']]
+    elif kind == 'batch_move':
+        task_ids = sorted({item['id'] for item in payload.get('changes', [])})
+    project_ids = set()
+    for task_id in task_ids:
+        task = session.get(Task, task_id, populate_existing=True)
+        if task:
+            snapshots.append(['task', task.id, task.revision])
+            if task.project_id is not None:
+                project_ids.add(task.project_id)
+    for project_id in sorted(project_ids):
+        project = session.get(Project, project_id, populate_existing=True)
+        if project:
+            snapshots.append(['project', project.id, project.revision])
     session.add(Setting(key=f'pending_change:{token}', value=json.dumps({
         'kind': kind, 'scope': str(scope), 'payload': payload,
-        'created_at': utcnow().isoformat(),
+        'created_at': utcnow().isoformat(), 'snapshots': snapshots,
     }, ensure_ascii=False)))
     return token
 
 
 def load_change(session, token):
+    from sqlalchemy import text
+    session.execute(text('SELECT pg_advisory_xact_lock(782364701)'))
     setting = session.get(Setting, f'pending_change:{token}', with_for_update=True)
     if not setting:
         raise ValueError('Предложение устарело или уже обработано.')
@@ -95,6 +116,12 @@ def load_change(session, token):
         raise ValueError('Предложение заменено новым.')
     if utcnow() - datetime.fromisoformat(draft['created_at']) > timedelta(hours=24):
         raise ValueError('Предложение устарело. Запроси его заново.')
+    from .db import Task, Project
+    for kind, identifier, revision in draft.get('snapshots', []):
+        model = Task if kind == 'task' else Project
+        current = session.get(model, identifier, with_for_update=True, populate_existing=True)
+        if not current or current.revision != revision:
+            raise ValueError('Запись изменилась после подготовки предложения.')
     return setting, draft
 
 

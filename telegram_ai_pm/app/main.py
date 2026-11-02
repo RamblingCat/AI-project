@@ -12,6 +12,21 @@ from openai import AsyncOpenAI
 from .db import Base, engine, Session, Project, Task, Evidence, EventLog, Notification, Setting, TaskDependency, utcnow
 from .ai import answer, draft_tasks, assess_evidence, propose_next_step, classify_intent, find_semantic_duplicates
 from .calendar import events_for_day
+from .services.tasks import update_task, can_finish, lock as lock_domain, estimate_snapshot
+from .services.projects import update_project
+from .services.planning import project_summary, task_summary, forecast, display_due
+from functools import wraps
+
+
+def user_errors(handler):
+    @wraps(handler)
+    async def wrapped(message, *args, **kwargs):
+        try:
+            return await handler(message, *args, **kwargs)
+        except ValueError as exc:
+            await message.answer(f'Изменения не внесены: {exc}')
+    return wrapped
+
 from .workflow import (future_due, require_transition, save_change, load_change,
                        change_buttons, PRIORITIES, CLOSED, validate_task_items)
 
@@ -51,7 +66,7 @@ async def help_(m:Message):
     await m.answer('''/project Название | цель | критерий успеха | work/personal — черновик проекта
 /approve ID — утвердить проект
 /task Название | YYYY-MM-DD HH:MM | P1/P2/P3/P4 | критерии | ID проекта (необязательно)
-/begin ID — начать работу (planned → in_progress)
+/hierarchy — задачи, подзадачи, прогресс и время\n/begin ID — начать работу (planned → in_progress)
 /depends BEFORE AFTER — сохранить зависимость BEFORE → AFTER
 /undepend BEFORE AFTER — удалить зависимость
 /dependencies — сохранённые зависимости
@@ -93,8 +108,9 @@ async def risks(m: Message):
                     t.due_at.astimezone(TZ).isoformat()
                     if t.due_at else None
                 ),
-                'estimate_minutes': t.estimate_minutes,
-                'project_id': t.project_id,
+                'estimate_minutes': task_summary(s, t)['estimate'],
+                'unestimated': task_summary(s, t)['unestimated'],
+                'parent_task_id': t.parent_task_id,
             }
             for t in tasks
         ]
@@ -204,7 +220,8 @@ async def risks(m: Message):
     'after — номер задачи, которая зависит от before. '
     'Все предполагаемые зависимости помечай confirmed=false. '
     'Для level используй только CRITICAL, HIGH или MEDIUM. '
-    'Не добавляй другие поля.'
+    'Не добавляй другие поля. Оценки родителей агрегированы: не складывай их с детьми. '
+    'Без явных интервалов расписания не утверждай, что работы невозможно выполнить одновременно.'
 )
                 },
                 {
@@ -399,20 +416,22 @@ async def project(m:Message):
     scope=parts[3].strip() if len(parts)>3 else 'work'
     if not title or scope not in ('work','personal'): return await m.answer('Укажи название и область work/personal.')
     with Session.begin() as s:
+        lock_domain(s)
         p=Project(title=title,goal=goal,success_criteria=criteria,scope=scope,status='draft'); s.add(p); s.flush(); pid=p.id
         s.add(EventLog(kind='project_draft',object_id=pid))
+        s.merge(Setting(key=f'context:{OWNER}:project', value=str(pid)))
     await m.answer(f'Проект #{pid} создан как черновик. Утвердить: /approve {pid}')
 
 @dp.message(Command('approve'))
+@user_errors
 async def approve(m:Message):
     if not allowed(m.from_user.id): return
     try: pid=int(m.text.split()[1])
     except (IndexError,ValueError): return await m.answer('Формат: /approve ID')
     with Session.begin() as s:
-        p=s.get(Project,pid)
-        if not p: result='Проект не найден.'
-        else:
-            p.status='active'; s.add(EventLog(kind='project_approved',object_id=pid)); result=f'Проект #{pid} активирован.'
+        lock_domain(s)
+        p = update_project(s, pid, {'status': 'active'})
+        result = f'Проект #{p.id} активирован.'
     await m.answer(result)
 
 @dp.message(Command('task'))
@@ -426,29 +445,52 @@ async def task(m:Message):
         if not title or not criteria or priority not in ('P1','P2','P3','P4'): raise ValueError('Нужны название, критерии и приоритет P1–P4')
     except ValueError as exc: return await m.answer(str(exc))
     with Session.begin() as s:
-        if pid and (not s.get(Project,pid) or s.get(Project,pid).status!='active'):
+        lock_domain(s)
+        if pid and (not s.get(Project,pid) or s.get(Project,pid).status not in ('planned','active')):
             result='Укажи ID активного проекта.'
         else:
             t=Task(title=title,due_at=due,priority=priority,criteria=criteria,project_id=pid); s.add(t); s.flush(); tid=t.id
-            s.add(EventLog(kind='task_created',object_id=tid)); result=f'Задача #{tid} сохранена. Срок: {due.astimezone(TZ):%d.%m %H:%M} МСК.'
+            s.add(EventLog(kind='task_created',object_id=tid)); s.merge(Setting(key=f'context:{OWNER}:task', value=str(tid))); result=f'Задача #{tid} сохранена. Срок: {due.astimezone(TZ):%d.%m %H:%M} МСК.'
     await m.answer(result)
 
 @dp.message(Command('projects'))
 async def projects(m:Message):
     if not allowed(m.from_user.id): return
-    with Session() as s: rows=s.query(Project).order_by(Project.id.desc()).limit(30).all(); lines=[f'#{p.id} {p.title} [{p.status}; {p.scope}]' for p in rows]
-    await m.answer('\n'.join(lines) or 'Проектов пока нет.')
+    from .natural import send_pages
+    with Session() as s:
+        lines=[]
+        for p in s.query(Project).order_by(Project.id.desc()):
+            info=project_summary(s,p)
+            lines.append(f'#{p.id} {p.title} [{p.status}]; прогресс {info["done"]}/{info["count"]}; срок {display_due(info["planned_due"])}; ручной {display_due(info["manual_due"])}; без срока {info["undated"]}')
+    await send_pages(m, lines or ['Проектов пока нет.'])
+
+@dp.message(Command('hierarchy'))
+async def hierarchy(m: Message):
+    if not allowed(m.from_user.id): return
+    from .natural import send_pages
+    with Session() as s:
+        tasks=s.query(Task).order_by(Task.id).all()
+        lines=[]
+        for root in (t for t in tasks if t.parent_task_id is None):
+            info=task_summary(s,root)
+            lines.append(f'#{root.id} {root.title} [{root.status}]; проект #{root.project_id or "—"}; {info["done"]}/{info["count"]}; оценка {info["estimate"]} мин + неоценено {info["unestimated"]}; факт {info["actual"]} мин + без записей {info["unreported"]}; отклонение {info["deviation_minutes"] if info["deviation_minutes"] is not None else "ещё неизвестно"}')
+            lines.extend(f'  ↳ #{t.id} {t.title} [{t.status}]' for t in tasks if t.parent_task_id==root.id)
+    await send_pages(m, lines or ['Задач нет.'])
+
 
 @dp.message(Command('today'))
 async def today(m:Message):
     if not allowed(m.from_user.id): return
     await m.answer(await daily_text())
 
-async def daily_text():
+async def daily_text(proactive=False):
     now=localnow(); start=now.replace(hour=0,minute=0,second=0,microsecond=0); end=start+timedelta(days=1)
     with Session() as s:
         tasks=s.query(Task).filter(Task.status.notin_(['done','cancelled'])).order_by(Task.due_at.asc().nullslast()).limit(30).all()
-        lines=[f'#{t.id} [{t.priority}/{t.status}] {t.title} — '+(t.due_at.astimezone(TZ).strftime('%d.%m %H:%M') if t.due_at else 'без срока') for t in tasks]
+        if proactive:
+            active_projects={p.id for p in s.query(Project).filter_by(status='active')}
+            tasks=[t for t in tasks if t.project_id is None or t.project_id in active_projects]
+        lines=[(f'  ↳ #{t.id} (родитель #{t.parent_task_id})' if t.parent_task_id else f'#{t.id}') + f' [{t.priority}/{t.status}] {t.title} — '+(t.due_at.astimezone(TZ).strftime('%d.%m %H:%M') if t.due_at else 'без срока') for t in tasks]
     events,err=await asyncio.to_thread(events_for_day, start, end)
     cal='\n'.join(f"• {e['start']} — {e['title']}" for e in events[:12]) or 'Нет событий'
     if err: cal=err
@@ -462,6 +504,7 @@ async def dependency(m: Message):
         command, raw_before, raw_after = m.text.split()
         before, after = int(raw_before), int(raw_after)
         with Session.begin() as s:
+            lock_domain(s)
             if command.split('@')[0] == '/depends':
                 add_dependency(s, before, after)
                 kind = 'dependency_added'
@@ -491,6 +534,7 @@ async def dependencies(m: Message):
 
 
 @dp.message(Command('done'))
+@user_errors
 async def done(m:Message):
     if not allowed(m.from_user.id): return
     try:
@@ -498,10 +542,11 @@ async def done(m:Message):
         if not sep or len(proof)<8: raise ValueError()
     except ValueError: return await m.answer('Формат: /done ID | ссылка или описание результата (минимум 8 символов)')
     with Session.begin() as s:
+        lock_domain(s)
         t=s.get(Task,tid,with_for_update=True)
         if not t or t.status != 'in_progress': msg='Сдать результат можно только для задачи в работе. Сначала: /begin ID.'
         else:
-            require_transition(t.status, 'review'); t.status='review'; s.add(Evidence(task_id=tid,content=proof)); s.add(EventLog(kind='evidence_submitted',object_id=tid)); msg=f'Результат задачи #{tid} сохранён. Проверь соответствие критериям: {t.criteria}\nПодтверди: /verify {tid}\nИли отклони: /reject {tid} | причина'
+            can_finish(s, t); require_transition(t.status, 'review'); t.status='review'; s.add(Evidence(task_id=tid,content=proof)); s.add(EventLog(kind='evidence_submitted',object_id=tid)); msg=f'Результат задачи #{tid} сохранён. Проверь соответствие критериям: {t.criteria}\nПодтверди: /verify {tid}\nИли отклони: /reject {tid} | причина'
     await m.answer(msg)
     if msg.startswith('Результат задачи #'):
         try:
@@ -515,38 +560,40 @@ async def done(m:Message):
             await m.answer('Предварительная AI-проверка недоступна. Результат сохранён на ручную проверку; задача не закрыта.')
 
 @dp.message(Command('begin'))
+@user_errors
 async def begin(m: Message):
     if not allowed(m.from_user.id): return
     try:
         tid = int(m.text.split()[1])
         with Session.begin() as s:
+            lock_domain(s)
             task = s.get(Task, tid, with_for_update=True)
             if not task:
                 raise ValueError('Задача не найдена.')
             if task.status != 'planned':
                 raise ValueError('Начать работу можно только для запланированной задачи; для возврата с проверки используй /reject.')
-            require_transition(task.status, 'in_progress')
-            task.status = 'in_progress'
-            s.add(EventLog(kind='task_status_changed', object_id=tid,
-                           detail={'old': 'planned', 'new': 'in_progress', 'source': 'begin'}))
+            update_task(s, tid, {'status': 'in_progress'})
         result = f'Задача #{tid} переведена в работу.'
     except (ValueError, IndexError) as exc:
         result = str(exc) if isinstance(exc, ValueError) else 'Формат: /begin ID'
     await m.answer(result)
 
 @dp.message(Command('verify'))
+@user_errors
 async def verify(m:Message):
     if not allowed(m.from_user.id): return
     try: tid=int(m.text.split()[1])
     except (IndexError,ValueError): return await m.answer('Формат: /verify ID')
     with Session.begin() as s:
+        lock_domain(s)
         t=s.get(Task,tid,with_for_update=True); ev=s.query(Evidence).filter_by(task_id=tid).order_by(Evidence.id.desc()).first()
         if not t or t.status!='review' or not ev: msg='Нет задачи с результатом на проверке.'
         else:
-            require_transition(t.status, 'done'); ev.verified=True; t.status='done'; s.add(EventLog(kind='task_verified',object_id=tid)); msg=f'Задача #{tid} подтверждена и закрыта.'
+            can_finish(s, t); require_transition(t.status, 'done'); ev.verified=True; t.status='done'; s.add(EventLog(kind='task_verified',object_id=tid)); msg=f'Задача #{tid} подтверждена и закрыта.'
     await m.answer(msg)
 
 @dp.message(Command('reject'))
+@user_errors
 async def reject(m:Message):
     if not allowed(m.from_user.id): return
     try:
@@ -554,6 +601,7 @@ async def reject(m:Message):
         if not sep or not reason.strip(): raise ValueError()
     except ValueError: return await m.answer('Формат: /reject ID | причина')
     with Session.begin() as s:
+        lock_domain(s)
         t=s.get(Task,tid,with_for_update=True)
         if not t or t.status!='review': msg='Задача не ожидает проверки.'
         else:
@@ -561,6 +609,7 @@ async def reject(m:Message):
     await m.answer(msg)
 
 @dp.message(Command('move'))
+@user_errors
 async def move(m:Message):
     if not allowed(m.from_user.id): return
     try:
@@ -568,13 +617,14 @@ async def move(m:Message):
         if not sep: raise ValueError()
     except ValueError: return await m.answer('Формат: /move ID | YYYY-MM-DD HH:MM')
     with Session.begin() as s:
+        lock_domain(s)
         t=s.get(Task,tid,with_for_update=True)
         if not t or t.status in CLOSED: msg='Задача не найдена или уже закрыта.'
         else:
-            old=str(t.due_at); t.due_at=due; t.reschedules+=1
-            s.add(EventLog(kind='deadline_moved',object_id=tid,detail={'old':old,'new':due.isoformat()}))
-            msg=f'Срок задачи #{tid} изменён. Переносов: {t.reschedules}.'
-            if t.reschedules>=3: msg+=' Это третий или последующий перенос. Стоит пересмотреть объём и препятствия.'
+            update_task(s, tid, {'due': date})
+            msg = f'Срок задачи #{tid} изменён. Переносов: {t.reschedules}.'
+            warnings = forecast(s)
+            if warnings: msg += '\n' + '\n'.join(warnings)
     await m.answer(msg)
 
 @dp.message(Command('pause'))
@@ -617,6 +667,7 @@ async def confirm_draft(c:CallbackQuery):
 
     try:
         with Session.begin() as s:
+            lock_domain(s)
             setting = (
                 s.query(Setting)
                 .filter_by(key=draft_key)
@@ -643,7 +694,7 @@ async def confirm_draft(c:CallbackQuery):
                     pid = item['project_id']
                     if pid is not None:
                         project = s.get(Project, pid)
-                        if not project or project.status != 'active':
+                        if not project or project.status not in ('planned', 'active'):
                             raise ValueError(
                                 'Проект больше не активен. Задачи не сохранены.'
                             )
@@ -704,10 +755,14 @@ async def confirm_change(c: CallbackQuery):
     _, action, token = parts
     try:
         with Session.begin() as s:
+            lock_domain(s)
             setting, envelope = load_change(s, token)
             kind, draft = envelope['kind'], envelope['payload']
             if action == 'cancel':
                 msg = 'Предложение отменено. Ничего не изменено.'
+            elif kind == 'domain':
+                from .services.proposals import apply
+                msg = apply(s, draft, c.from_user.id, operation_id=token)
             elif kind == 'batch_move':
                 updates = []
                 for item in sorted(draft['changes'], key=lambda item: item['id']):
@@ -721,8 +776,7 @@ async def confirm_change(c: CallbackQuery):
                 if not updates:
                     raise ValueError('Пустой план переноса')
                 for task, due, old in updates:
-                    task.due_at = due
-                    task.reschedules += 1
+                    update_task(s, task.id, {'due': due.astimezone(TZ).strftime('%Y-%m-%d %H:%M')})
                     s.add(EventLog(kind='deadline_moved', object_id=task.id,
                                    detail={'old': old, 'new': due.isoformat(), 'source': 'approved_batch_move'}))
                 msg = 'Сроки изменены одной транзакцией: ' + ', '.join(f'#{t.id}' for t, _, _ in updates)
@@ -736,32 +790,33 @@ async def confirm_change(c: CallbackQuery):
                 if kind == 'priority':
                     if task.priority != draft['old'] or draft['new'] not in PRIORITIES:
                         raise ValueError('Приоритет изменился или некорректен')
-                    task.priority = draft['new']
+                    update_task(s, tid, {'priority': draft['new']})
                     s.add(EventLog(kind='task_priority_changed', object_id=tid, detail=draft))
                     msg = f'Приоритет задачи #{tid} изменён на {task.priority}.'
                 elif kind == 'status':
                     if task.status != draft['old'] or draft['new'] != 'in_progress':
                         raise ValueError('Недопустимый переход статуса')
                     require_transition(task.status, draft['new'])
-                    task.status = draft['new']
+                    update_task(s, tid, {'status': draft['new']})
                     s.add(EventLog(kind='task_status_changed', object_id=tid, detail=draft))
                     msg = f'Задача #{tid} переведена в работу.'
                 elif kind == 'move':
                     current = task.due_at.isoformat() if task.due_at else None
                     if current != draft['old']:
                         raise ValueError('Срок задачи уже изменился')
-                    task.due_at = date_parse(draft['new'])
-                    task.reschedules += 1
+                    update_task(s, tid, {'due': draft['new']})
                     s.add(EventLog(kind='deadline_moved', object_id=tid, detail=draft))
                     msg = f'Срок задачи #{tid} изменён.'
                 elif kind == 'next_step':
+                    if task.parent_task_id is not None:
+                        raise ValueError('Разрешено только два уровня задач')
                     if task.project_id != draft['project_id']:
                         raise ValueError('Проект исходной задачи изменился')
                     project = s.get(Project, task.project_id, with_for_update=True) if task.project_id else None
-                    if task.project_id and (not project or project.status != 'active'):
+                    if task.project_id and (not project or project.status not in ('planned', 'active')):
                         raise ValueError('Проект больше не активен')
                     child = Task(title=draft['title'], criteria=draft['criteria'],
-                                 project_id=task.project_id, priority=task.priority,
+                                 project_id=task.project_id, parent_task_id=task.id, priority=task.priority,
                                  due_at=date_parse(draft['due']))
                     s.add(child)
                     s.flush()
@@ -770,6 +825,10 @@ async def confirm_change(c: CallbackQuery):
                     msg = f'Создана задача #{child.id} «{child.title}» как следующий шаг по задаче #{tid}.'
                 else:
                     raise ValueError('Неизвестная операция')
+            if action == 'approve' and kind != 'domain':
+                s.flush()
+                warnings = forecast(s)
+                if warnings: msg += '\n' + '\n'.join(warnings)
             s.delete(setting)
     except (ValueError, KeyError, TypeError) as exc:
         msg = f'Операция отклонена: {exc}. Ничего не изменено.'
@@ -791,6 +850,13 @@ async def reject_legacy_confirmation(c: CallbackQuery):
 @dp.message(F.text)
 async def chat(m:Message):
     if not allowed(m.from_user.id): return
+    from .natural import handle
+    try:
+        if await handle(m, OWNER): return
+    except Exception:
+        logging.exception('Natural-language request failed')
+        await m.answer('Не удалось подготовить корректное предложение. Изменения не внесены.')
+        return
     text=(m.text or '').lower()
     # Multi-task analysis must be handled before the single-task branch.
     # Capture numbers only in an explicit task-ID enumeration, not dates or times.
@@ -887,6 +953,7 @@ async def chat(m:Message):
                             changes.append({'id':tid,'old':old,'new':proposed[tid],'status':t.status})
             if len(changes)>=2:
                 with Session.begin() as s:
+                    lock_domain(s)
                     save_change(s, 'batch_move', 'all', {'changes': changes})
                 suffix='\n\nПредложенные сроки сохранены как черновик. Чтобы увидеть кнопки подтверждения, напиши: «Согласен с планом по задачам '+', '.join('№'+str(i) for i in task_ids)+'. Подготовь изменение сроков». До подтверждения ничего не изменится.'
             else:
@@ -992,6 +1059,7 @@ async def chat(m:Message):
                 return
 
             with Session.begin() as s:
+                lock_domain(s)
                 token = save_change(s, 'priority', tid, {
                     'task_id': tid, 'status': status, 'old': priority, 'new': new_priority})
             keyboard = change_buttons(token, '✅ Подтвердить изменение')
@@ -1021,6 +1089,7 @@ async def chat(m:Message):
                 return
 
             with Session.begin() as s:
+                lock_domain(s)
                 token = save_change(s, 'status', tid, {
                     'task_id': tid, 'status': status, 'old': status, 'new': 'in_progress'})
             keyboard = change_buttons(token, '✅ Подтвердить начало работы')
@@ -1049,6 +1118,7 @@ async def chat(m:Message):
                     await m.answer(f'Задача #{tid} закрыта. Перенос невозможен.')
                     return
                 with Session.begin() as s:
+                    lock_domain(s)
                     token = save_change(s, 'move', tid, {
                         'task_id': tid, 'status': status, 'old': old_iso, 'new': new_text})
                 keyboard = change_buttons(token, '✅ Подтвердить перенос')
@@ -1087,6 +1157,7 @@ async def chat(m:Message):
                        'due':step_due.strftime('%Y-%m-%d %H:%M'),'created_at':utcnow().isoformat()}
                 draft.update(task_id=tid, status=status, project_id=task_info['project_id'])
                 with Session.begin() as s:
+                    lock_domain(s)
                     token = save_change(s, 'next_step', tid, draft)
                 keyboard = change_buttons(token, '✅ Создать подзадачу')
                 await m.answer(
@@ -1123,9 +1194,7 @@ async def chat(m:Message):
 
     if intent == 'update_task':
         await m.answer(
-            'Понял запрос на изменение существующей задачи. '
-            'Пока автоматическое изменение через обычный текст '
-            'не подключено. Задачи не изменены.'
+            'Укажи ID или точное название задачи и нужное изменение. Задачи не изменены.'
         )
         return
 
@@ -1189,6 +1258,7 @@ async def chat(m:Message):
                 return
             draft_id = uuid.uuid4().hex
             with Session.begin() as s:
+                lock_domain(s)
                 s.add(Setting(
                     key=f'pending_task_draft:{draft_id}',
                     value=json.dumps(tasks, ensure_ascii=False)
@@ -1232,6 +1302,7 @@ async def chat(m:Message):
 async def send_once(key, text):
     from sqlalchemy.dialects.postgresql import insert
     with Session.begin() as s:
+        lock_domain(s)
         claim = s.execute(insert(Notification).values(key=key, created_at=utcnow())
                           .on_conflict_do_nothing(index_elements=['key'])
                           .returning(Notification.id)).scalar_one_or_none()
@@ -1241,6 +1312,7 @@ async def send_once(key, text):
     except Exception:
         logging.exception('Telegram send failure')
         with Session.begin() as s:
+            lock_domain(s)
             n=s.get(Notification, claim)
             if n: s.delete(n)
         return False
@@ -1257,11 +1329,12 @@ def morning_risks_text():
             )
             .all()
         )
+        active_projects={p.id for p in s.query(Project).filter_by(status='active')}
 
         overdue = [
             (t.id, t.title)
             for t in tasks
-            if t.due_at.astimezone(TZ) < now
+            if t.due_at.astimezone(TZ) < now and (t.project_id is None or t.project_id in active_projects)
         ]
 
     if not overdue:
@@ -1291,7 +1364,7 @@ async def morning():
         '☀️ Утренний брифинг\n\n'
         + morning_risks_text()
         + '\n\n'
-        + await daily_text()
+        + await daily_text(proactive=True)
         + '\n\nКакие три приоритета утверждаем сегодня?'
     )
 
@@ -1302,14 +1375,14 @@ async def morning():
 
 async def evening():
     if not is_worktime(): return
-    await send_once('evening:'+localnow().date().isoformat(),'Вечерний отчёт. Подтверди результаты и обозначь препятствия:\n\n'+await daily_text())
+    await send_once('evening:'+localnow().date().isoformat(),'Вечерний отчёт. Подтверди результаты и обозначь препятствия:\n\n'+await daily_text(proactive=True))
 
 async def deadlines():
     if not is_worktime(): return
     now=utcnow()
     with Session() as s:
         tasks=s.query(Task).filter(Task.status.notin_(['done','cancelled','review']),Task.due_at.isnot(None),Task.due_at<=now+timedelta(minutes=15)).limit(100).all()
-        entries=[(t.id,t.title,t.due_at,t.criteria) for t in tasks]
+        entries=[(t.id,t.title,t.due_at,t.criteria) for t in tasks if t.project_id is None or (s.get(Project,t.project_id) and s.get(Project,t.project_id).status == 'active')]
     for tid,title,due,criteria in entries:
         if due<=now:
             key=f'overdue:{tid}:{due.isoformat()}'
