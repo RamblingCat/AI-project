@@ -19,6 +19,13 @@ class Project(Base):
     scope = Column(String(20), default='work')
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
+    description = Column(Text, nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    auto_due_at = Column(DateTime(timezone=True), nullable=True)
+    manual_due_at = Column(DateTime(timezone=True), nullable=True)
+    planned_due_at = Column(DateTime(timezone=True), nullable=True)
+    revision = Column(Integer, nullable=False, server_default='0')
+
 class Task(Base):
     __tablename__ = 'tasks'
     id = Column(Integer, primary_key=True)
@@ -35,6 +42,13 @@ class Task(Base):
     last_reminded_at = Column(DateTime(timezone=True), nullable=True)
     last_checked_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow)
+    parent_task_id = Column(Integer, ForeignKey('tasks.id', ondelete='RESTRICT'), index=True)
+    complexity = Column(String(20), nullable=True)
+    task_type = Column(String(30), nullable=True)
+    scheduled_start_at = Column(DateTime(timezone=True), nullable=True)
+    scheduled_end_at = Column(DateTime(timezone=True), nullable=True)
+    revision = Column(Integer, nullable=False, server_default='0')
+    __table_args__ = (CheckConstraint('parent_task_id <> id', name='task_not_own_parent'),)
 
 class Evidence(Base):
     __tablename__ = 'evidence'
@@ -76,3 +90,27 @@ class TaskDependency(Base):
     before_id = Column(Integer, ForeignKey('tasks.id', ondelete='CASCADE'), primary_key=True)
     after_id = Column(Integer, ForeignKey('tasks.id', ondelete='CASCADE'), primary_key=True)
     __table_args__ = (CheckConstraint('before_id <> after_id', name='dependency_not_self'),)
+
+
+class TaskTimeEntry(Base):
+    __tablename__ = 'task_time_entries'
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, ForeignKey('tasks.id', ondelete='RESTRICT'), nullable=False, index=True)
+    minutes = Column(Integer, nullable=False)
+    operation_id = Column(String(32), unique=True, nullable=False)
+    comment = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (CheckConstraint('minutes > 0', name='time_entry_positive'),)
+
+
+class TaskEstimateRevision(Base):
+    __tablename__ = 'task_estimate_revisions'
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, ForeignKey('tasks.id', ondelete='RESTRICT'), nullable=False, index=True)
+    minutes = Column(Integer, nullable=False)
+    breakdown = Column(JSON, nullable=False)
+    complexity = Column(String(20), nullable=True)
+    task_type = Column(String(30), nullable=True)
+    reason = Column(String(100), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (CheckConstraint('minutes >= 0', name='estimate_nonnegative'),)

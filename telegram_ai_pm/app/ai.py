@@ -22,7 +22,16 @@ async def answer(text):
         tasks = s.query(Task).filter(Task.status.notin_(['done','cancelled'])).order_by(Task.due_at.asc().nullslast()).limit(30).all()
         projects = s.query(Project).order_by(Project.id.desc()).limit(15).all()
         history = s.query(Message).order_by(Message.id.desc()).limit(12).all()[::-1]
-        context = 'Проекты: ' + str([(p.id,p.title,p.goal,p.status) for p in projects]) + '\nЗадачи: ' + str([(t.id,t.title,t.status,t.priority,str(t.due_at),t.criteria) for t in tasks])
+        from .services.planning import task_summary
+        task_context = []
+        for task in tasks:
+            info = task_summary(s, task)
+            task_context.append(dict(id=task.id, title=task.title, status=task.status,
+                priority=task.priority, due=str(task.due_at), criteria=task.criteria,
+                parent_task_id=task.parent_task_id, estimate=info['estimate'],
+                unestimated=info['unestimated'], actual=info['actual'], progress=f"{info['done']}/{info['count']}"))
+        context = 'Проекты: ' + str([(p.id,p.title,p.goal,p.status,str(p.planned_due_at),str(p.manual_due_at)) for p in projects]) + '\nЗадачи: ' + str(task_context)
+        context += '\nОценка родителя агрегирована по детям. Для общего времени считай только листья, не суммируй родителей с детьми. Равные дедлайны не доказывают пересечение работ.'
         messages = [{'role':'system','content':SYSTEM+'\n'+context}] + [{'role':m.role,'content':m.content} for m in history] + [{'role':'user','content':text}]
     result = await client.chat.completions.create(model=os.getenv('OPENAI_MODEL','gpt-4.1-mini'), messages=messages, temperature=0.3)
     output = result.choices[0].message.content or 'Не удалось сформировать ответ.'

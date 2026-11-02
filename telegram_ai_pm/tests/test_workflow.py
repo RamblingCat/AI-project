@@ -328,30 +328,49 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await m.send_once('test-notification', 'Test'))
         self.assertEqual(send.await_count, 2)
 
+    def legacy_case(self, incompatible=False):
+        from alembic import command
+        from alembic.config import Config
+        from sqlalchemy import create_engine
+        from pathlib import Path
+        name = 'pm_test_legacy_' + uuid.uuid4().hex
+        admin.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(name)))
+        legacy_url = make_url(ADMIN).set(drivername='postgresql+psycopg', database=name)
+        legacy = create_engine(legacy_url)
+        try:
+            with patch.dict(os.environ, DATABASE_URL=legacy_url.render_as_string(hide_password=False)):
+                cfg = Config(str(Path(__file__).resolve().parents[1] / 'alembic.ini'))
+                command.upgrade(cfg, '0002')
+                with legacy.begin() as c:
+                    c.exec_driver_sql("INSERT INTO projects(title,status) VALUES ('Legacy','active')")
+                    c.exec_driver_sql("INSERT INTO tasks(title,project_id) VALUES ('Preserved',1)")
+                    if incompatible:
+                        c.exec_driver_sql('ALTER TABLE tasks ADD COLUMN unknown_legacy_field TEXT')
+                if incompatible:
+                    with self.assertRaisesRegex(RuntimeError, 'incompatible'):
+                        upgrade()
+                    with legacy.connect() as c:
+                        self.assertEqual(c.exec_driver_sql('SELECT version_num FROM alembic_version').scalar(), '0002')
+                else:
+                    for revision in ('0003', '0004', '0005'):
+                        command.upgrade(cfg, revision)
+                        with legacy.connect() as c:
+                            self.assertEqual(c.exec_driver_sql('SELECT version_num FROM alembic_version').scalar(), revision)
+                            self.assertEqual(c.exec_driver_sql('SELECT title FROM tasks WHERE id=1').scalar(), 'Preserved')
+                    upgrade()
+                with legacy.connect() as c:
+                    self.assertEqual(c.exec_driver_sql('SELECT title FROM tasks WHERE id=1').scalar(), 'Preserved')
+                    if not incompatible:
+                        self.assertIsNone(c.exec_driver_sql('SELECT parent_task_id FROM tasks WHERE id=1').scalar())
+        finally:
+            legacy.dispose()
+            admin.execute(sql.SQL('DROP DATABASE {} WITH (FORCE)').format(sql.Identifier(name)))
+
     async def test_migrations_adopt_legacy_and_preserve_rows(self):
-        with engine.begin() as connection:
-            connection.exec_driver_sql('DROP TABLE alembic_version')
-            connection.exec_driver_sql('DROP TABLE task_dependencies')
-            connection.exec_driver_sql('ALTER TABLE tasks DROP COLUMN estimate_minutes, DROP COLUMN effort_breakdown')
-        upgrade()
-        upgrade()
-        with Session() as s:
-            self.assertEqual(s.get(Task, self.tid).title, 'Task')
-            self.assertIsNone(s.get(Task, self.tid).estimate_minutes)
+        self.legacy_case()
 
     async def test_migrations_refuse_incompatible_legacy_schema(self):
-        with engine.begin() as connection:
-            connection.exec_driver_sql('DROP TABLE alembic_version')
-            connection.exec_driver_sql('ALTER TABLE tasks ADD COLUMN unknown_legacy_field TEXT')
-        try:
-            with self.assertRaisesRegex(RuntimeError, 'incompatible'):
-                upgrade()
-            with Session() as s:
-                self.assertEqual(s.get(Task, self.tid).title, 'Task')
-        finally:
-            with engine.begin() as connection:
-                connection.exec_driver_sql('ALTER TABLE tasks DROP COLUMN unknown_legacy_field')
-            upgrade()
+        self.legacy_case(incompatible=True)
 
 
 if __name__ == '__main__':
